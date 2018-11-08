@@ -41,6 +41,12 @@
 #include <avr/interrupt.h>
 #include "xmega_usart.h"
 #include "dbec_imu_eval.h"
+#include <avr/pgmspace.h>   // needed for EEPROM access to get ADC calibration
+#include <stddef.h>
+
+#if 0
+#include <avr/iox256a3b.h>
+#endif
 
 #if(CALIBRATION_MODE)
 #include "ls7166.h"
@@ -59,6 +65,23 @@ volatile uint8_t configMsgDue = 0;
 // interrupt service routine prototype(s)
 ISR(TCC1_OVF_vect);
 
+
+//from: https://www.avrfreaks.net/forum/xmega-production-signature-row
+uint8_t ReadCalibrationByte( uint8_t index ){
+    uint8_t result;
+
+    /* Load the NVM Command register to read the calibration row. */
+    NVM_CMD = NVM_CMD_READ_CALIB_ROW_gc;
+    result = pgm_read_byte(index);
+
+    /* Clean up NVM Command register. */
+    NVM_CMD = NVM_CMD_NO_OPERATION_gc;
+
+    return( result );
+}
+
+
+
 // simple main function to configure IMUs and stream data via USART
 // TODO: replace all "magic numbers", hard-coded ports, pins, registers, and values with #define statements
 int main(void) {
@@ -73,6 +96,7 @@ int main(void) {
 	uint8_t readByte;
 	uint8_t thisRegAddr = 0x00;
 	uint16_t thisMicroTime;
+	uint16_t adcResult;
 
 #if(CALIBRATION_MODE)
 	uint32_t encoderCount;
@@ -120,7 +144,7 @@ int main(void) {
 
 	// initialize USART, configure for STDOUT, and send ASCII boot message
 	initStdOutUSART();
-	printf("IMU Evaluation\r\n");
+	printf("Press Speed Monitor\r\n");
 
 	// initialize ST IMU
 	initST();
@@ -129,6 +153,39 @@ int main(void) {
 #if(CALIBRATION_MODE)
 	LS7166Init();
 #endif
+
+	// configure ADC on PORTA
+	PORTA.OUT |= PIN0_bm;       // make VREF an output to keep it from sinking current
+	PORTA.OUT &= ~PIN1_bm;
+
+
+	PR.PRPA &= ~0x02; // Clear ADC bit in Power Reduction Port B Register
+
+	ADCA.CALL = ReadCalibrationByte( offsetof(NVM_PROD_SIGNATURES_t, ADCACAL0) );
+	ADCA.CALH = ReadCalibrationByte( offsetof(NVM_PROD_SIGNATURES_t, ADCACAL1) );
+	ADCA.CALL = ReadCalibrationByte( offsetof(NVM_PROD_SIGNATURES_t, ADCACAL0) );
+	ADCA.CALH = ReadCalibrationByte( offsetof(NVM_PROD_SIGNATURES_t, ADCACAL1) );
+
+	ADCA.CH1.CTRL = ADC_CH_INPUTMODE0_bm; // 0x01
+	ADCB.CH1.MUXCTRL = ADC_CH_MUXINT0_bm; // 0x08
+
+	ADCA.CTRLB = 0x00;
+	ADCA.REFCTRL = 0x20;
+	ADCA.EVCTRL = 0x00;
+	ADCA.PRESCALER = 0x00;
+	ADCA.CTRLA = 0x01;
+
+	while(1){
+		printf("Starting Conversion\r\n");
+		ADCA.CTRLA = 0x09;
+		while(!(ADCA.INTFLAGS & 0x01)){
+			NOP();
+		}
+		ADCA.INTFLAGS |= 0x01;
+		adcResult = (((uint16_t)(ADCA.CH1RESH)) << 8) & ((uint16_t)(ADCA.CH1RESL));
+		printf("Read: %06d\r\n",adcResult);
+		_delay_ms(1000);
+	}
 
 	// Step 2: collect and transmit data forever
 	while(1){
