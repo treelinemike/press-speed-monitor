@@ -26,6 +26,10 @@
  *
  */
 
+// uncomment this line to allow Eclipse IDE to index device-specific symbols
+//#include <avr/iox256a3b.h>
+
+
 // set default CPU clock frequency to 16MHz (external crystal)
 #ifndef F_CPU
 #define F_CPU 16000000UL
@@ -44,9 +48,6 @@
 #include <avr/pgmspace.h>   // needed for EEPROM access to get ADC calibration
 #include <stddef.h>
 
-#if 0
-#include <avr/iox256a3b.h>
-#endif
 
 #if(CALIBRATION_MODE)
 #include "ls7166.h"
@@ -124,8 +125,8 @@ int main(void) {
 	TCC0.PER = 40000;     						// 40000 = 0.01s (100Hz) with 16MHz clock and prescaler = 4
 
 	// configure PC0 for toggling by counter if desired (manually, not with hardware output compare - done in ISR)
-	PORTC.DIR |= PIN0_bm;
-	PORTC.OUT &= ~PIN0_bm;
+	PORTC_DIR |= PIN0_bm;
+	PORTC_OUT &= ~PIN0_bm;
 
 	// configure TCC1 to increment at 16us for comparison to IMU timestamps
 	TCC1.CTRLA = 0x00 | TC_CLKSEL_DIV256_gc; 	// prescaler = 256, 16us per count
@@ -138,9 +139,7 @@ int main(void) {
 	TCC1.PER = 65535;							// let counter overflow at 2^16 (0.000016s*65535 = 1.05s between overflows)
 	//TCC1.PER = 0;								// for debugging, set TCC1.PER = 0 and scope PC0
 
-	// enable interrupts
-	PMIC.CTRL |= PMIC_HILVLEN_bm | PMIC_MEDLVLEN_bm | PMIC_LOLVLEN_bm;
-	sei();
+
 
 	// initialize USART, configure for STDOUT, and send ASCII boot message
 	initStdOutUSART();
@@ -155,36 +154,48 @@ int main(void) {
 #endif
 
 	// configure ADC on PORTA
-	PORTA.OUT |= PIN0_bm;       // make VREF an output to keep it from sinking current
-	PORTA.OUT &= ~PIN1_bm;
+	PORTA_DIR = 0x00;  // all input?
+	//PIN0_bm;       // make VREF an output to keep it from sinking current
+	//PORTA.DIR = PIN1_bm;
 
 
-	PR.PRPA &= ~0x02; // Clear ADC bit in Power Reduction Port B Register
-
+	PR.PRPA   = 0x05; // Clear ADC bit in Power Reduction Register, do not send clock to DAC or AC, write n/c bits to 0 per datasheet
 	ADCA.CALL = ReadCalibrationByte( offsetof(NVM_PROD_SIGNATURES_t, ADCACAL0) );
 	ADCA.CALH = ReadCalibrationByte( offsetof(NVM_PROD_SIGNATURES_t, ADCACAL1) );
 	ADCA.CALL = ReadCalibrationByte( offsetof(NVM_PROD_SIGNATURES_t, ADCACAL0) );
 	ADCA.CALH = ReadCalibrationByte( offsetof(NVM_PROD_SIGNATURES_t, ADCACAL1) );
 
-	ADCA.CH1.CTRL = ADC_CH_INPUTMODE0_bm; // 0x01
-	ADCB.CH1.MUXCTRL = ADC_CH_MUXINT0_bm; // 0x08
+	// from: https://embededtutorials.wordpress.com/tag/xmega-adc/
+	ADCA.CTRLB      =  (0x00 | 0x80);  // low impedance source (opamp output)
+	ADCA.REFCTRL    =  0x20;
+	ADCA.EVCTRL     =  0x00;
+	ADCA.PRESCALER  =  0x00;
 
-	ADCA.CTRLB = 0x00;
-	ADCA.REFCTRL = 0x20;
-	ADCA.EVCTRL = 0x00;
-	ADCA.PRESCALER = 0x00;
-	ADCA.CTRLA = 0x01;
+	ADCA.CH0.CTRL    = 0x01; 	       // single ended (in unsigned mode)
+	ADCA.CH0.MUXCTRL = 0x08; 	       // input on pin PA1/ADC1 (#63)
+	ADCA.CTRLA       = 0x01;           //enable ADC
+
+
+
+	// enable interrupts
+	PMIC.CTRL |= PMIC_HILVLEN_bm | PMIC_MEDLVLEN_bm | PMIC_LOLVLEN_bm;
+	sei();
 
 	while(1){
-		printf("Starting Conversion\r\n");
-		ADCA.CTRLA = 0x09;
-		while(!(ADCA.INTFLAGS & 0x01)){
-			NOP();
-		}
-		ADCA.INTFLAGS |= 0x01;
-		adcResult = (((uint16_t)(ADCA.CH1RESH)) << 8) & ((uint16_t)(ADCA.CH1RESL));
-		printf("Read: %06d\r\n",adcResult);
-		_delay_ms(1000);
+		// start a conversion
+		ADCA.CH0.INTFLAGS = 0x01;                 // write 1 to flag to clear it
+		ADCA.CH0.CTRL |= 0x80;                    // start conversion
+
+		// wait for conversion to complete
+		while(!(ADCA.CH0.INTFLAGS & 0x01));
+		ADCA.CH0.INTFLAGS = 0x01;                 // write 1 to flag to clear it
+
+		// display result
+		adcResult = ADCA.CH0.RES;//(((uint16_t)(ADCA.CH0.RESH)) << 8) & ((uint16_t)(ADCA.CH0.RESL));
+		printf("ADC Result: %04u\r",adcResult);
+
+		// wait
+		_delay_ms(100);
 	}
 
 	// Step 2: collect and transmit data forever
