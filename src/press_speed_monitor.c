@@ -8,7 +8,7 @@
  * Author: 	M. Kokko
  *
  * Timer Configuration:
- * 1. TCC0: 100Hz   (dt = 10ms) used for consistent loop/sampling period
+ * 1. TCC0: 1.00Hz   (dt = 1s) used for consistent loop/sampling period
  *
  * TODO: pull all port/pin definitions, configuration settings, and "magic numbers" out of code, pass as parameters or #define
  * TODO: add watchdog timer
@@ -36,20 +36,18 @@
 #endif
 
 // global variables for ADC
-// TODO: Replace globals with another mechanism for passing data to/from ISR
+// TODO: replace globals with another mechanism for passing data to/from ISR
 #define ADC_WINDOW_SIZE 10
 volatile uint16_t adc_result_vector[ADC_WINDOW_SIZE];
 volatile uint16_t  *adc_result_vector_pos = adc_result_vector;
 volatile uint8_t adc_result_vector_full = 0;
 volatile uint8_t adc_result_vector_lock = 0;
 
-
 // interrupt service routine prototype(s)
 ISR(ADCA_CH0_vect);
 
 // function prototypes
 uint8_t ReadCalibrationByte( uint8_t index );
-
 
 // simple main function to read from string pot and compute speed
 // TODO: replace all "magic numbers", hard-coded ports, pins, registers, and values with #define statements
@@ -58,8 +56,6 @@ int main(void) {
 	// declare variables for use in main() scope
 	volatile uint16_t  *adc_vector_read_pointer;
 	uint8_t loopcount = 0;
-	uint16_t local_result_vector[ADC_WINDOW_SIZE];
-	uint16_t *local_result_vector_pointer;
 	uint32_t adc_sum;
 	uint16_t pos_prev = 0, pos_cur = 0;
 	float speed;
@@ -72,15 +68,15 @@ int main(void) {
 	CCP = CCP_IOREG_gc;  						// write correct signature (0xD8) to change protection register first
 	CLK.CTRL = CLK_SCLKSEL_XOSC_gc;  			// use external clock source (0x03); 0x01 selects 32MHz internal RC oscillator
 
-	// configure TCC0 to cycle at 100Hz
-	TCC0.CTRLA = 0x00 | TC_CLKSEL_DIV4_gc;   	// prescaler = 4; 16MHz/4 = 4MHz -> 250ns/tick
-	TCC0.CTRLB = 0x00 | TC_WGMODE_NORMAL_gc; 	// normal operation (expire at PER)
-	TCC0.CTRLC = 0x00;
-	TCC0.CTRLD = 0x00;
-	TCC0.CTRLE = 0x00;
+	// configure TCC0 to cycle at 1.00Hz
+	TCC0.CTRLA    = 0x00 | TC_CLKSEL_DIV256_gc; // prescaler = 256; 16MHz/256 = 62.5kHz -> 16us/tick
+	TCC0.CTRLB    = 0x00 | TC_WGMODE_NORMAL_gc; // normal operation (expire at PER)
+	TCC0.CTRLC    = 0x00;
+	TCC0.CTRLD    = 0x00;
+	TCC0.CTRLE    = 0x00;
 	TCC0.INTCTRLA = 0x00 | TC_OVFINTLVL_LO_gc; 	// enable timer overflow interrupt
 	TCC0.INTCTRLB = 0x00;
-	TCC0.PER = 40000;     						// 40000 = 0.01s (100Hz) with 16MHz clock and prescaler = 4
+	TCC0.PER      = 62500;     				    // 62500 = 1.00s (1.00Hz) with 16MHz clock and prescaler = 256
 
 	// initialize USART, configure for STDOUT, and send ASCII boot message
 	initStdOutUSART();
@@ -112,9 +108,10 @@ int main(void) {
 	// and report linear velocity
 	while(1){
 
-		// initialize pointers for copying ADC results
+		// initialize pointer for copying ADC results
+		// and reset ADC sum to zero
 		adc_vector_read_pointer = adc_result_vector;
-		//local_result_vector_pointer = local_result_vector;
+		adc_sum = 0;
 
 		// wait for lock to become available
 		while(adc_result_vector_lock);
@@ -123,11 +120,8 @@ int main(void) {
 		adc_result_vector_lock = 1;
 
 		// copy ADC results
-		adc_sum = 0;
 		while(adc_vector_read_pointer < (adc_result_vector + ADC_WINDOW_SIZE) ){
-			//*local_result_vector_pointer = *adc_vector_read_pointer;
 			adc_sum += *adc_vector_read_pointer;
-			//++local_result_vector_pointer;
 			++adc_vector_read_pointer;
 		}
 
@@ -136,24 +130,12 @@ int main(void) {
 
 		// compute speed
 		pos_cur = (uint16_t)(adc_sum/((uint32_t)ADC_WINDOW_SIZE)); // note: integer division
-
-		speed = (( ((float)pos_cur) - ((float)pos_prev) ) *((float)5.9))/( ((float)38.73) );  // speed in in/sec
+		speed = (( ((float)pos_cur) - ((float)pos_prev) ) *((float)5.9))/( ((float)3873) );  // [in/sec]
 		pos_prev = pos_cur;
 
-		// display results on loopcount mod 10
-		if(loopcount == 9){
-
-
-			// display latest values
-			/*
-			printf("Recent readings: ");
-			local_result_vector_pointer = local_result_vector;
-			while(local_result_vector_pointer < (local_result_vector + ADC_WINDOW_SIZE) ){
-				printf("%04u ",*local_result_vector_pointer);
-				++local_result_vector_pointer;
-			}
-			printf("\r\n");
-			*/
+		// display results intermittently
+		// TODO: fix magic number!
+		if(loopcount == 0){
 			printf("ADC Counts: %04u     Speed: %+06.3f\r",pos_prev, speed);
 			loopcount = 0;
 		} else{
@@ -161,7 +143,8 @@ int main(void) {
 		}
 
 		// force loop timing with TCC0
-		// TODO: throw error if this timer has already expired when we get here; for now we can check this using timestamps in transmitted data
+		// TODO: throw error if this timer has already expired when we get here
+		// potential source of error in computed speed
 		while(!(TCC0.INTFLAGS & TC0_OVFIF_bm));
 		TCC0.INTFLAGS |= TC0_OVFIF_bm;
 
@@ -169,13 +152,13 @@ int main(void) {
 }
 
 // ADC interrupt vector
-// execution automatically clears interrupt flag bit
+// note: interrupt flag bit automatically cleared on execution
 ISR(ADCA_CH0_vect){
 
 	// only read ADC if we can take the lock
 	if( !adc_result_vector_lock ){
 
-		// take lock
+		// acquire lock
 		adc_result_vector_lock = 1;
 
 		// store result in ADC array
@@ -194,7 +177,8 @@ ISR(ADCA_CH0_vect){
 	}
 }
 
-//from: https://www.avrfreaks.net/forum/xmega-production-signature-row
+// function to get ADC calibration from non-volatile memory
+// directly from: https://www.avrfreaks.net/forum/xmega-production-signature-row
 uint8_t ReadCalibrationByte( uint8_t index ){
 	uint8_t result;
 
