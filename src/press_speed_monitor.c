@@ -60,6 +60,9 @@ int main(void) {
 	uint8_t loopcount = 0;
 	uint16_t local_result_vector[ADC_WINDOW_SIZE];
 	uint16_t *local_result_vector_pointer;
+	uint32_t adc_sum;
+	uint16_t pos_prev = 0, pos_cur = 0;
+	float speed;
 
 	// change to 16MHz external oscillator
 	NOP(); NOP();NOP(); NOP();  				// wait a few clock cycles to be safe
@@ -111,7 +114,7 @@ int main(void) {
 
 		// initialize pointers for copying ADC results
 		adc_vector_read_pointer = adc_result_vector;
-		local_result_vector_pointer = local_result_vector;
+		//local_result_vector_pointer = local_result_vector;
 
 		// wait for lock to become available
 		while(adc_result_vector_lock);
@@ -120,20 +123,29 @@ int main(void) {
 		adc_result_vector_lock = 1;
 
 		// copy ADC results
+		adc_sum = 0;
 		while(adc_vector_read_pointer < (adc_result_vector + ADC_WINDOW_SIZE) ){
-			*local_result_vector_pointer = *adc_vector_read_pointer;
-			++local_result_vector_pointer;
+			//*local_result_vector_pointer = *adc_vector_read_pointer;
+			adc_sum += *adc_vector_read_pointer;
+			//++local_result_vector_pointer;
 			++adc_vector_read_pointer;
 		}
 
 		// release lock on ADC result vector
 		adc_result_vector_lock = 0;
 
+		// compute speed
+		pos_cur = (uint16_t)(adc_sum/((uint32_t)ADC_WINDOW_SIZE)); // note: integer division
+
+		speed = (( ((float)pos_cur) - ((float)pos_prev) ) *((float)5.9))/( ((float)38.73) );  // speed in in/sec
+		pos_prev = pos_cur;
 
 		// display results on loopcount mod 10
-		if(loopcount == 49){
+		if(loopcount == 9){
+
 
 			// display latest values
+			/*
 			printf("Recent readings: ");
 			local_result_vector_pointer = local_result_vector;
 			while(local_result_vector_pointer < (local_result_vector + ADC_WINDOW_SIZE) ){
@@ -141,8 +153,8 @@ int main(void) {
 				++local_result_vector_pointer;
 			}
 			printf("\r\n");
-
-
+			*/
+			printf("ADC Counts: %04u     Speed: %+06.3f\r",pos_prev, speed);
 			loopcount = 0;
 		} else{
 			++loopcount;
