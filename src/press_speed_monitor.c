@@ -65,20 +65,27 @@ volatile uint8_t configMsgDue = 0;
 
 // interrupt service routine prototype(s)
 ISR(TCC1_OVF_vect);
+ISR(ADCA_CH0_vect);
 
+
+#define ADC_WINDOW_SIZE 10
+volatile uint16_t adc_result_vector[ADC_WINDOW_SIZE];
+volatile uint16_t  *adc_result_vector_pos = adc_result_vector;
+volatile uint8_t adc_result_vector_full = 0;
+volatile uint8_t adc_result_vector_lock = 0;
 
 //from: https://www.avrfreaks.net/forum/xmega-production-signature-row
 uint8_t ReadCalibrationByte( uint8_t index ){
-    uint8_t result;
+	uint8_t result;
 
-    /* Load the NVM Command register to read the calibration row. */
-    NVM_CMD = NVM_CMD_READ_CALIB_ROW_gc;
-    result = pgm_read_byte(index);
+	/* Load the NVM Command register to read the calibration row. */
+	NVM_CMD = NVM_CMD_READ_CALIB_ROW_gc;
+	result = pgm_read_byte(index);
 
-    /* Clean up NVM Command register. */
-    NVM_CMD = NVM_CMD_NO_OPERATION_gc;
+	/* Clean up NVM Command register. */
+	NVM_CMD = NVM_CMD_NO_OPERATION_gc;
 
-    return( result );
+	return( result );
 }
 
 
@@ -98,6 +105,10 @@ int main(void) {
 	uint8_t thisRegAddr = 0x00;
 	uint16_t thisMicroTime;
 	uint16_t adcResult;
+	volatile uint16_t  *adc_vector_read_pointer;
+	uint8_t loopcount = 0;
+	uint16_t local_result_vector[ADC_WINDOW_SIZE];
+	uint16_t *local_result_vector_pointer;
 
 #if(CALIBRATION_MODE)
 	uint32_t encoderCount;
@@ -166,13 +177,14 @@ int main(void) {
 	ADCA.CALH = ReadCalibrationByte( offsetof(NVM_PROD_SIGNATURES_t, ADCACAL1) );
 
 	// from: https://embededtutorials.wordpress.com/tag/xmega-adc/
-	ADCA.CTRLB      =  (0x00 | 0x80);  // low impedance source (opamp output)
+	ADCA.CTRLB      =  (0x00 | 0x80 | 0x08);  // low impedance source (opamp output), freerunning mode
 	ADCA.REFCTRL    =  0x20;
-	ADCA.EVCTRL     =  0x00;
-	ADCA.PRESCALER  =  0x00;
+	ADCA.EVCTRL     =  0x00;           // sweep channel ADC0 only
+	ADCA.PRESCALER  =  0x01;		   // clk_adc = (clk_per / 8) = (16,000,000/8) = 2MHz; ADC clock should be 100kHz - 2MHz
 
 	ADCA.CH0.CTRL    = 0x01; 	       // single ended (in unsigned mode)
 	ADCA.CH0.MUXCTRL = 0x08; 	       // input on pin PA1/ADC1 (#63)
+	ADCA.CH0.INTCTRL = 0x03;  		   // High-level interrupt, triggered on conversion completion
 	ADCA.CTRLA       = 0x01;           //enable ADC
 
 
@@ -181,21 +193,58 @@ int main(void) {
 	PMIC.CTRL |= PMIC_HILVLEN_bm | PMIC_MEDLVLEN_bm | PMIC_LOLVLEN_bm;
 	sei();
 
+	// start a conversion
+	ADCA.CH0.INTFLAGS = 0x01;                 // write 1 to flag to clear it
+	ADCA.CH0.CTRL |= 0x80;                    // start conversion
 	while(1){
-		// start a conversion
-		ADCA.CH0.INTFLAGS = 0x01;                 // write 1 to flag to clear it
-		ADCA.CH0.CTRL |= 0x80;                    // start conversion
 
-		// wait for conversion to complete
-		while(!(ADCA.CH0.INTFLAGS & 0x01));
-		ADCA.CH0.INTFLAGS = 0x01;                 // write 1 to flag to clear it
+		// initialize pointers for copying ADC results
+		adc_vector_read_pointer = adc_result_vector;
+		local_result_vector_pointer = local_result_vector;
 
-		// display result
-		adcResult = ADCA.CH0.RES;//(((uint16_t)(ADCA.CH0.RESH)) << 8) & ((uint16_t)(ADCA.CH0.RESL));
-		printf("ADC Result: %04u\r",adcResult);
+		// wait for lock to become available
+		while(adc_result_vector_lock);
 
-		// wait
-		_delay_ms(100);
+		// acquire lock on ADC result vector
+		adc_result_vector_lock = 1;
+
+		// copy ADC results
+		while(adc_vector_read_pointer < (adc_result_vector + ADC_WINDOW_SIZE) ){
+			*local_result_vector_pointer = *adc_vector_read_pointer;
+			++local_result_vector_pointer;
+			++adc_vector_read_pointer;
+		}
+
+		// release lock on ADC result vector
+		adc_result_vector_lock = 0;
+
+
+		// display results on loopcount mod 10
+		if(loopcount == 49){
+
+
+
+			// display latest values
+			printf("Recent readings: ");
+			local_result_vector_pointer = local_result_vector;
+			while(local_result_vector_pointer < (local_result_vector + ADC_WINDOW_SIZE) ){
+				printf("%04u ",*local_result_vector_pointer);
+				++local_result_vector_pointer;
+			}
+			printf("\r\n");
+
+
+			loopcount = 0;
+		} else{
+			++loopcount;
+		}
+
+		// force loop timing with TCC0
+		// TODO: throw error if this timer has already expired when we get here; for now we can check this using timestamps in transmitted data
+		while(!(TCC0.INTFLAGS & TC0_OVFIF_bm));
+		TCC0.INTFLAGS |= TC0_OVFIF_bm;
+
+
 	}
 
 	// Step 2: collect and transmit data forever
@@ -298,6 +347,32 @@ int main(void) {
 	return 0;
 }
 
+// ADC interrupt vector
+// execution automatically clears interrupt flag bit
+ISR(ADCA_CH0_vect){
+
+	// only read ADC if we can take the lock
+	if( !adc_result_vector_lock ){
+
+		// take lock
+		adc_result_vector_lock = 1;
+
+		// store result in ADC array
+		*adc_result_vector_pos = ADCA.CH0.RES;
+
+		// increment pointer
+		++adc_result_vector_pos;
+		if(adc_result_vector_pos >= (adc_result_vector + ADC_WINDOW_SIZE)){
+			adc_result_vector_pos = adc_result_vector;
+			adc_result_vector_full = 1;
+		}
+
+		// release lock
+		adc_result_vector_lock = 0;
+
+	}
+}
+
 // interrupt service routine for TCC1 timer
 // keeps track of when configuration messages
 // need to be sent and toggles an output pin
@@ -314,7 +389,6 @@ ISR(TCC1_OVF_vect){
 	}
 
 	// toggle output pin for debugging purposes
-	/*
 	if(tcc1IntState){
 		PORTC.OUT &= ~PIN0_bm;
 		tcc1IntState = 0;
@@ -322,5 +396,4 @@ ISR(TCC1_OVF_vect){
 		PORTC.OUT |= PIN0_bm;
 		tcc1IntState = 1;
 	}
-	 */
 }
