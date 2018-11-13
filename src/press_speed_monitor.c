@@ -1,25 +1,14 @@
-/* imu-eval-main.c
+/* press_speed_monitor.c
  *
- * Firmware for ATxmega256A3BU to capture data from gyro/accel
- * IMU chip(s) and stream back to PC via RS232 link. Communicates
- * with ST #LSM6DS3 using SPI bus and accepts optical encoder input
- * via LS7166 quadrature counting interface for gyro calibration.
+ * Firmware for ATxmega256A3BU to capture data from string potentiometer
+ * to monitor angular extrusion press speed. Data are streamed back
+ * to PC via RS232 link in ASCII format.
  *
- * Date: 	2016-06-22
+ * Date: 	2018-11-13
  * Author: 	M. Kokko
- *
- * Code Flow:
- * 1. Configure peripherals and sensor interfaces
- * 2. Infinite loop:
- * 	  2A: If new IMU data available, read and pass to PC as a packet including an MCU-derived timestamp
- * 	  2B: If in "calibration" mode, send another packet of encoder position data with an MCU-derived timestamp
- * 	  2C: Send "configuration" packet to PC every so often with IMU and MCU configuration parameters for record keeping
  *
  * Timer Configuration:
  * 1. TCC0: 100Hz   (dt = 10ms) used for consistent loop/sampling period
- * 2. TCC1: 62.5kHz (dt = 16us); 16-bit counter overflows in 0.000016*65535 = 1.04856s
- *          used for timestamping data read from sensors (IMU and encoder), interrupts
- *          on overflow/reset
  *
  * TODO: pull all port/pin definitions, configuration settings, and "magic numbers" out of code, pass as parameters or #define
  * TODO: add watchdog timer
@@ -29,96 +18,51 @@
 // uncomment this line to allow Eclipse IDE to index device-specific symbols
 //#include <avr/iox256a3b.h>
 
-
 // set default CPU clock frequency to 16MHz (external crystal)
 #ifndef F_CPU
 #define F_CPU 16000000UL
 #endif
 
-// calibration mode control
-// 0: normal operating mode, encoder not read
-// 1: calibration mode, encoder data captured and transmitted
-#define CALIBRATION_MODE 1
-
 // required includes
 #include <avr/io.h>
 #include <avr/interrupt.h>
 #include "xmega_usart.h"
-#include "dbec_imu_eval.h"
 #include <avr/pgmspace.h>   // needed for EEPROM access to get ADC calibration
 #include <stddef.h>
-
-
-#if(CALIBRATION_MODE)
-#include "ls7166.h"
-#endif
 
 // define "no-op" macro to waste a clock cycle
 #ifndef NOP
 #define NOP() asm("nop")
 #endif
 
-// global variables for timer state
-volatile uint8_t tcc1IntState = 0;
-volatile uint8_t tcc1IntCount = 0;
-volatile uint8_t configMsgDue = 0;
-
-// interrupt service routine prototype(s)
-ISR(TCC1_OVF_vect);
-ISR(ADCA_CH0_vect);
-
-
+// global variables for ADC
+// TODO: Replace globals with another mechanism for passing data to/from ISR
 #define ADC_WINDOW_SIZE 10
 volatile uint16_t adc_result_vector[ADC_WINDOW_SIZE];
 volatile uint16_t  *adc_result_vector_pos = adc_result_vector;
 volatile uint8_t adc_result_vector_full = 0;
 volatile uint8_t adc_result_vector_lock = 0;
 
-//from: https://www.avrfreaks.net/forum/xmega-production-signature-row
-uint8_t ReadCalibrationByte( uint8_t index ){
-	uint8_t result;
 
-	/* Load the NVM Command register to read the calibration row. */
-	NVM_CMD = NVM_CMD_READ_CALIB_ROW_gc;
-	result = pgm_read_byte(index);
+// interrupt service routine prototype(s)
+ISR(ADCA_CH0_vect);
 
-	/* Clean up NVM Command register. */
-	NVM_CMD = NVM_CMD_NO_OPERATION_gc;
-
-	return( result );
-}
+// function prototypes
+uint8_t ReadCalibrationByte( uint8_t index );
 
 
-
-// simple main function to configure IMUs and stream data via USART
+// simple main function to read from string pot and compute speed
 // TODO: replace all "magic numbers", hard-coded ports, pins, registers, and values with #define statements
 int main(void) {
 
 	// declare variables for use in main() scope
-	uint8_t allIMUDataST[12];
-	uint8_t *pAllIMUDataST;
-	uint8_t timeStampDataST[3];
-	uint8_t *pTimeStampDataST;
-	uint8_t configDataST[5];
-	uint8_t *pConfigDataST;
-	uint8_t readByte;
-	uint8_t thisRegAddr = 0x00;
-	uint16_t thisMicroTime;
-	uint16_t adcResult;
 	volatile uint16_t  *adc_vector_read_pointer;
 	uint8_t loopcount = 0;
 	uint16_t local_result_vector[ADC_WINDOW_SIZE];
 	uint16_t *local_result_vector_pointer;
 
-#if(CALIBRATION_MODE)
-	uint32_t encoderCount;
-#endif
-
-	// Step 1: Configuration and sensor initialization
-
 	// change to 16MHz external oscillator
 	NOP(); NOP();NOP(); NOP();  				// wait a few clock cycles to be safe
-	//PORTR.DIR = 0xFF; 						// set port R for output to drive crystal (not sure if necessary)
 	OSC.XOSCCTRL = 0xDB; 						// OSC_FRQRANGE_12TO16_gc | OSC_XOSCSEL_XTAL_16KCLK_gc; // select frequency of external oscillator
 	OSC.CTRL = OSC_XOSCEN_bm;  					// turn on external oscillator
 	while(!(OSC.STATUS & OSC_XOSCRDY_bm)){}; 	// wait for oscillator to stabilize
@@ -135,67 +79,34 @@ int main(void) {
 	TCC0.INTCTRLB = 0x00;
 	TCC0.PER = 40000;     						// 40000 = 0.01s (100Hz) with 16MHz clock and prescaler = 4
 
-	// configure PC0 for toggling by counter if desired (manually, not with hardware output compare - done in ISR)
-	PORTC_DIR |= PIN0_bm;
-	PORTC_OUT &= ~PIN0_bm;
-
-	// configure TCC1 to increment at 16us for comparison to IMU timestamps
-	TCC1.CTRLA = 0x00 | TC_CLKSEL_DIV256_gc; 	// prescaler = 256, 16us per count
-	TCC1.CTRLB = 0x00 | TC_WGMODE_NORMAL_gc; 	// normal operation (expire at PER)
-	TCC1.CTRLC = 0x00;
-	TCC1.CTRLD = 0x00;
-	TCC1.CTRLE = 0x00;
-	TCC1.INTCTRLA = 0x00 | TC_OVFINTLVL_HI_gc; 	// enable timer overflow interrupt
-	TCC1.INTCTRLB = 0x00;
-	TCC1.PER = 65535;							// let counter overflow at 2^16 (0.000016s*65535 = 1.05s between overflows)
-	//TCC1.PER = 0;								// for debugging, set TCC1.PER = 0 and scope PC0
-
-
-
 	// initialize USART, configure for STDOUT, and send ASCII boot message
 	initStdOutUSART();
 	printf("Press Speed Monitor\r\n");
 
-	// initialize ST IMU
-	initST();
-
-	// initialize quadrature counter for encoder if in calibration mode
-#if(CALIBRATION_MODE)
-	LS7166Init();
-#endif
-
-	// configure ADC on PORTA
-	PORTA_DIR = 0x00;  // all input?
-	//PIN0_bm;       // make VREF an output to keep it from sinking current
-	//PORTA.DIR = PIN1_bm;
-
-
+	// Initialize ADCA
+	PORTA_DIR = 0x00;  // configure ADC on PORTA to be all input
 	PR.PRPA   = 0x05; // Clear ADC bit in Power Reduction Register, do not send clock to DAC or AC, write n/c bits to 0 per datasheet
 	ADCA.CALL = ReadCalibrationByte( offsetof(NVM_PROD_SIGNATURES_t, ADCACAL0) );
 	ADCA.CALH = ReadCalibrationByte( offsetof(NVM_PROD_SIGNATURES_t, ADCACAL1) );
 	ADCA.CALL = ReadCalibrationByte( offsetof(NVM_PROD_SIGNATURES_t, ADCACAL0) );
 	ADCA.CALH = ReadCalibrationByte( offsetof(NVM_PROD_SIGNATURES_t, ADCACAL1) );
 
-	// from: https://embededtutorials.wordpress.com/tag/xmega-adc/
 	ADCA.CTRLB      =  (0x00 | 0x80 | 0x08);  // low impedance source (opamp output), freerunning mode
 	ADCA.REFCTRL    =  0x20;
-	ADCA.EVCTRL     =  0x00;           // sweep channel ADC0 only
-	ADCA.PRESCALER  =  0x01;		   // clk_adc = (clk_per / 8) = (16,000,000/8) = 2MHz; ADC clock should be 100kHz - 2MHz
+	ADCA.EVCTRL     =  0x00;                  // sweep channel ADC0 only
+	ADCA.PRESCALER  =  0x01;		          // clk_adc = (clk_per / 8) = (16,000,000/8) = 2MHz; ADC clock should be 100kHz - 2MHz
 
-	ADCA.CH0.CTRL    = 0x01; 	       // single ended (in unsigned mode)
-	ADCA.CH0.MUXCTRL = 0x08; 	       // input on pin PA1/ADC1 (#63)
-	ADCA.CH0.INTCTRL = 0x03;  		   // High-level interrupt, triggered on conversion completion
-	ADCA.CTRLA       = 0x01;           //enable ADC
-
-
+	ADCA.CH0.CTRL    = 0x01; 	              // single ended (in unsigned mode)
+	ADCA.CH0.MUXCTRL = 0x08; 	              // input on pin PA1/ADC1 (#63)
+	ADCA.CH0.INTCTRL = 0x03;  		          // High-level interrupt, triggered on conversion completion
+	ADCA.CTRLA       = 0x01;                  //enable ADC
 
 	// enable interrupts
 	PMIC.CTRL |= PMIC_HILVLEN_bm | PMIC_MEDLVLEN_bm | PMIC_LOLVLEN_bm;
 	sei();
 
-	// start a conversion
-	ADCA.CH0.INTFLAGS = 0x01;                 // write 1 to flag to clear it
-	ADCA.CH0.CTRL |= 0x80;                    // start conversion
+	// continually read string pot position
+	// and report linear velocity
 	while(1){
 
 		// initialize pointers for copying ADC results
@@ -222,8 +133,6 @@ int main(void) {
 		// display results on loopcount mod 10
 		if(loopcount == 49){
 
-
-
 			// display latest values
 			printf("Recent readings: ");
 			local_result_vector_pointer = local_result_vector;
@@ -244,107 +153,7 @@ int main(void) {
 		while(!(TCC0.INTFLAGS & TC0_OVFIF_bm));
 		TCC0.INTFLAGS |= TC0_OVFIF_bm;
 
-
 	}
-
-	// Step 2: collect and transmit data forever
-	while(1){
-
-		// Step 2A: if new data available, read from IMU and pass to PC along with timestamp from TCC1
-		readST(0x1E,&readByte);
-		if(1 && ((readByte & 0x02) || (readByte & 0x01))){
-
-			// grab a timestamp from the microcontroller TCC1 counter
-			// this timestamp is as close as we can get to IMU device data capture time
-			// TODO: Block internal IMU update before read & unblock after read to ensure data is very close to TCC1 timestamp
-			thisMicroTime = TCC1.CNT;
-
-			// read timestamp from IMU device
-			// TODO: pull out register addresses as #defines
-			pTimeStampDataST = timeStampDataST;
-			for(thisRegAddr = 0x40; thisRegAddr <= 0x42; thisRegAddr++){
-				readST(thisRegAddr,pTimeStampDataST);
-				++pTimeStampDataST;
-			}
-
-			// read IMU data
-			// TODO: pull out register addresses as #defines
-			pAllIMUDataST = allIMUDataST;
-			for(thisRegAddr=0x22; thisRegAddr <= 0x2D; thisRegAddr++){
-				readST(thisRegAddr,pAllIMUDataST);
-				++pAllIMUDataST;
-			}
-
-			// send IMU data packet to PC over RS232 link
-			sendIMUSerialPacket(PKT_TYPE_ST_DATA, thisMicroTime, timeStampDataST, 3, allIMUDataST, 12);
-		}
-
-		// Step 2B: if in calibration mode, read encoder and transmit packet with position data
-#if(CALIBRATION_MODE)
-
-		// grab a timestamp from the microcontroller TCC1 counter
-		thisMicroTime = TCC1.CNT;
-
-		// read encoder count from output latch of LS7166
-		LS7166ReadOL(&encoderCount);
-		//printf("Encoder Count: %09lu\r\n",encoderCount);
-
-		// send encoder data via serial port
-		sendEncoderSerialPacket(PKT_TYPE_ENCODER_DATA, thisMicroTime, encoderCount);
-
-#endif
-
-		// Step 2C: send a configuration message if one is due
-		// message timing based on TCC1 (see ISR)
-		if(configMsgDue){
-
-			// grab a timestamp from the microcontroller TCC1 counter
-			thisMicroTime = TCC1.CNT;
-
-			// read timestamp from IMU device
-			// TODO: pull out register addresses as #defines
-			pTimeStampDataST = timeStampDataST;
-			for(thisRegAddr = 0x40; thisRegAddr <= 0x42; thisRegAddr++){
-				readST(thisRegAddr,pTimeStampDataST);
-				++pTimeStampDataST;
-			}
-
-			// read device configuration from appropriate registers
-			// TODO: pull out register addresses as #defines
-			// TODO: make this more elegant
-			pConfigDataST = configDataST;
-			readST(0x10,pConfigDataST); 	// REG_VAL_A = accelerometer ODR & range
-			++pConfigDataST;
-			*pConfigDataST = 0x00;			// REG_VAL_B = 0x00
-			++pConfigDataST;
-			readST(0x11,pConfigDataST); 	// REG_VAL_C = gyro ODR & range
-			++pConfigDataST;
-			*pConfigDataST = 0x00;			// REG_VAL_D = 0x00
-			++pConfigDataST;
-			readST(0x5C,pConfigDataST); 	// REG_VAL_E = timestamp resolution
-
-			// send configuration message
-			sendIMUSerialPacket(PKT_TYPE_ST_CONFIG, thisMicroTime, timeStampDataST, 3, configDataST, 5);
-
-			// reset configuration message due flag
-			configMsgDue = 0;
-		}
-
-		// set output pin high at start of idle period
-		PORTC.OUT |= PIN0_bm;
-
-		// force loop timing with TCC0
-		// TODO: throw error if this timer has already expired when we get here; for now we can check this using timestamps in transmitted data
-		while(!(TCC0.INTFLAGS & TC0_OVFIF_bm));
-		TCC0.INTFLAGS |= TC0_OVFIF_bm;
-
-		// clear output pin at end of idle period
-		PORTC.OUT &= ~PIN0_bm;
-
-	} // end while(1)
-
-	// done, but program will never get here
-	return 0;
 }
 
 // ADC interrupt vector
@@ -373,27 +182,16 @@ ISR(ADCA_CH0_vect){
 	}
 }
 
-// interrupt service routine for TCC1 timer
-// keeps track of when configuration messages
-// need to be sent and toggles an output pin
-// for debug purposes
-// note: TC1_OVFIF bit in TCC1.INTFLAGS is
-// automatically cleard upon ISR execution
-ISR(TCC1_OVF_vect){
+//from: https://www.avrfreaks.net/forum/xmega-production-signature-row
+uint8_t ReadCalibrationByte( uint8_t index ){
+	uint8_t result;
 
-	// check to see whether we need to send a configuration message
-	++tcc1IntCount;
-	if(tcc1IntCount >= CONFIG_MSG_DT){
-		tcc1IntCount = 0;
-		configMsgDue = 1;
-	}
+	/* Load the NVM Command register to read the calibration row. */
+	NVM_CMD = NVM_CMD_READ_CALIB_ROW_gc;
+	result = pgm_read_byte(index);
 
-	// toggle output pin for debugging purposes
-	if(tcc1IntState){
-		PORTC.OUT &= ~PIN0_bm;
-		tcc1IntState = 0;
-	} else {
-		PORTC.OUT |= PIN0_bm;
-		tcc1IntState = 1;
-	}
+	/* Clean up NVM Command register. */
+	NVM_CMD = NVM_CMD_NO_OPERATION_gc;
+
+	return( result );
 }
