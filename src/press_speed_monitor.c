@@ -129,6 +129,7 @@ int main(void) {
 		adc_result_vector_lock = 0;
 
 		// compute speed
+		// TODO: magic numbers!
 		pos_cur = (uint16_t)(adc_sum/((uint32_t)ADC_WINDOW_SIZE)); // note: integer division
 		speed = (( ((float)pos_cur) - ((float)pos_prev) ) *((float)5.9))/( ((float)3873) );  // [in/sec]
 		pos_prev = pos_cur;
