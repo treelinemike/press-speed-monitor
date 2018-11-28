@@ -23,6 +23,10 @@
 #define F_CPU 16000000UL
 #endif
 
+// DEBUG_MODE toggles PA2 on each speed computation
+// allowing evaluation of timing with scope
+#define DEBUG_MODE 0
+
 // required includes
 #include <avr/io.h>
 #include <avr/interrupt.h>
@@ -60,6 +64,10 @@ int main(void) {
 	uint16_t pos_prev = 0, pos_cur = 0;
 	float speed;
 
+#if(DEBUG_MODE)
+	uint8_t led_flag = 0;
+#endif
+
 	// change to 16MHz external oscillator
 	NOP(); NOP();NOP(); NOP();  				// wait a few clock cycles to be safe
 	OSC.XOSCCTRL = 0xDB; 						// OSC_FRQRANGE_12TO16_gc | OSC_XOSCSEL_XTAL_16KCLK_gc; // select frequency of external oscillator
@@ -69,14 +77,14 @@ int main(void) {
 	CLK.CTRL = CLK_SCLKSEL_XOSC_gc;  			// use external clock source (0x03); 0x01 selects 32MHz internal RC oscillator
 
 	// configure TCC0 to cycle at 1.00Hz
-	TCC0.CTRLA    = 0x00 | TC_CLKSEL_DIV256_gc; // prescaler = 256; 16MHz/256 = 62.5kHz -> 16us/tick
+	TCC0.CTRLA    = 0x00 | TC_CLKSEL_DIV1024_gc; // prescaler = 1024; 16MHz/1024 = 15.625kHz -> 64us/tick
 	TCC0.CTRLB    = 0x00 | TC_WGMODE_NORMAL_gc; // normal operation (expire at PER)
 	TCC0.CTRLC    = 0x00;
 	TCC0.CTRLD    = 0x00;
 	TCC0.CTRLE    = 0x00;
 	TCC0.INTCTRLA = 0x00 | TC_OVFINTLVL_LO_gc; 	// enable timer overflow interrupt
 	TCC0.INTCTRLB = 0x00;
-	TCC0.PER      = 62500;     				    // 62500 = 1.00s (1.00Hz) with 16MHz clock and prescaler = 256
+	TCC0.PER      = 46875;     				    // 46875 = 3.00s (0.33Hz) with 16MHz clock and prescaler = 1024
 
 	// initialize USART, configure for STDOUT, and send ASCII boot message
 	initStdOutUSART();
@@ -104,9 +112,27 @@ int main(void) {
 	PMIC.CTRL |= PMIC_HILVLEN_bm | PMIC_MEDLVLEN_bm | PMIC_LOLVLEN_bm;
 	sei();
 
+#if(DEBUG_MODE)
+	// configure and clear debug pin
+	PORTA_DIR |= 0x04;
+	PORTA.OUT &= ~0x04;
+	led_flag = 0;
+#endif
+
 	// continually read string pot position
 	// and report linear velocity
 	while(1){
+
+		// toggle debug in in DEBUG_MODE
+#if(DEBUG_MODE)
+		if(led_flag){
+			PORTA.OUT &= ~0x04;
+			led_flag = 0;
+		} else {
+			PORTA.OUT |= 0x04;
+			led_flag = 1;
+		}
+#endif
 
 		// initialize pointer for copying ADC results
 		// and reset ADC sum to zero
@@ -131,7 +157,7 @@ int main(void) {
 		// compute speed
 		// TODO: magic numbers!
 		pos_cur = (uint16_t)(adc_sum/((uint32_t)ADC_WINDOW_SIZE)); // note: integer division
-		speed = (( ((float)pos_cur) - ((float)pos_prev) ) *((float)5.9))/( ((float)3873) );  // [in/sec]
+		speed = ( ((float)pos_cur) - ((float)pos_prev) ) / ( ((float)590.1) );  // [in/sec]
 		pos_prev = pos_cur;
 
 		// display results intermittently
