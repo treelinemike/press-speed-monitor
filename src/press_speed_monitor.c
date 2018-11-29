@@ -27,6 +27,14 @@
 // allowing evaluation of timing with scope
 #define DEBUG_MODE 0
 
+// SPEED SCALING CONSTANT [count*sec/in]
+// string pot was measured at 19.181" extension from 260 to 4095 (delta = 3835 counts) on 29-NOV-18
+// (3835 counts * 3sec)/(19.181 in) = 599.81 count*sec/in
+// assumes good linearity
+// TODO: magic numbers!
+
+#define STRING_POT_SPEED_CONST 599.81
+
 // required includes
 #include <avr/io.h>
 #include <avr/interrupt.h>
@@ -85,10 +93,11 @@ int main(void) {
 	TCC0.INTCTRLA = 0x00 | TC_OVFINTLVL_LO_gc; 	// enable timer overflow interrupt
 	TCC0.INTCTRLB = 0x00;
 	TCC0.PER      = 46875;     				    // 46875 = 3.00s (0.33Hz) with 16MHz clock and prescaler = 1024
+	//TCC0.PER      = 1563;     				    // 10Hz for use when measuring extension of string pot
 
 	// initialize USART, configure for STDOUT, and send ASCII boot message
 	initStdOutUSART();
-	printf("Press Speed Monitor\r\n");
+	printf("Press Speed Monitor\r\nUsing speed constant %6.2f count*sec/in\r\n",((float)STRING_POT_SPEED_CONST));
 
 	// Initialize ADCA
 	PORTA_DIR = 0x00;  // configure ADC on PORTA to be all input
@@ -155,15 +164,14 @@ int main(void) {
 		adc_result_vector_lock = 0;
 
 		// compute speed
-		// TODO: magic numbers!
 		pos_cur = (uint16_t)(adc_sum/((uint32_t)ADC_WINDOW_SIZE)); // note: integer division
-		speed = ( ((float)pos_cur) - ((float)pos_prev) ) / ( ((float)590.1) );  // [in/sec]
+		speed = ( ((float)pos_cur) - ((float)pos_prev) ) / ( ((float)STRING_POT_SPEED_CONST) );  // [in/sec]
 		pos_prev = pos_cur;
 
 		// display results intermittently
 		// TODO: fix magic number!
 		if(loopcount == 0){
-			printf("ADC Counts: %04u     Speed: %+06.3f\r",pos_prev, speed);
+			printf("ADC Counts: %04u     Speed [in/s]: %+06.3f\r",pos_prev, speed);
 			loopcount = 0;
 		} else{
 			++loopcount;
