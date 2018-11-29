@@ -8,7 +8,7 @@
  * Author: 	M. Kokko
  *
  * Timer Configuration:
- * 1. TCC0: 1.00Hz   (dt = 1s) used for consistent loop/sampling period
+ * 1. TCC0: 0.33Hz   (dt = 3s) used for consistent loop/sampling period
  *
  * TODO: pull all port/pin definitions, configuration settings, and "magic numbers" out of code, pass as parameters or #define
  * TODO: add watchdog timer
