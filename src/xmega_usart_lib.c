@@ -19,10 +19,10 @@ int initStdOutUSART(void){
 	// TXD0 = PE3
 	STDOUT_USART_PORT.OUTSET = 0x08; 							//TODO: unnecessary? remove this?
 	STDOUT_USART_PORT.DIRSET = 0x08; 							// need TX line to be set for output
-	STDOUT_USART.BAUDCTRLA = 0xD7; 								// 0xD7 for 115200 @ 16MHz Fosc (no CLK2X)
-	STDOUT_USART.BAUDCTRLB = 0x93; 								// 0x93 for 115200 @ 16MHz Fosc (no CLK2X)
-	//STDOUT_USART.BAUDCTRLA = 131;  							// 131 for 57,600 @ 16MHz Fosc (no CLK2X)
-	//STDOUT_USART.BAUDCTRLB = 0xD0; 							// 0xD0 for 57,600 @ 16MHz Fosc (no CLK2X)
+	//STDOUT_USART.BAUDCTRLA = 0xD7; 								// 0xD7 for 115200 @ 16MHz Fosc (no CLK2X)
+	//STDOUT_USART.BAUDCTRLB = 0x93; 								// 0x93 for 115200 @ 16MHz Fosc (no CLK2X)
+	STDOUT_USART.BAUDCTRLA = 131;  							// 131 for 57,600 @ 16MHz Fosc (no CLK2X)
+	STDOUT_USART.BAUDCTRLB = 0xD0; 							// 0xD0 for 57,600 @ 16MHz Fosc (no CLK2X)
 	//STDOUT_USART.BAUDCTRLA = 135;  							// 135 for 57,600 @ 32MHz Fosc (no CLK2X)
 	//STDOUT_USART.BAUDCTRLB = 0xE0; 							// 0xE0 for 57,600 @ 32MHz Fosc (no CLK2X)
 	STDOUT_USART.CTRLA = 0x00;									// no USART interrupts
