@@ -5,10 +5,12 @@
  * to PC via RS232 link in ASCII format.
  *
  * Date: 	2018-11-13
+ * Updated: 2020-08-27
  * Author: 	M. Kokko
  *
  * Timer Configuration:
- * 1. TCC0: 0.33Hz   (dt = 3s) used for consistent loop/sampling period
+ * 1. TCC0: 10kHz   (dt = 100us) used to start A/D conversions
+ * 2. TCC1: 0.33Hz   (dt = 3s) used for consistent loop/sampling period
  *
  * TODO: pull all port/pin definitions, configuration settings, and "magic numbers" out of code, pass as parameters or #define
  * TODO: add watchdog timer
@@ -29,11 +31,11 @@
 
 // SPEED SCALING CONSTANT [count*sec/in]
 // string pot was measured at 19.181" extension from 260 to 4095 (delta = 3835 counts) on 29-NOV-18
-// (3835 counts * 3sec)/(19.181 in) = 599.81 count*sec/in
+// (3835 counts * 3sec)/(19.181 in) = 599.81 count*sec/in -> ASSUMING SPEED CALCULATED AT 3sec INTERVALS
 // assumes good linearity
-// TODO: magic numbers!
+// TODO: remove magic numbers!
 
-#define STRING_POT_SPEED_CONST 599.81
+#define STRING_POT_SPEED_CONST 599.81   // COMPUTED AS ABOVE
 
 // required includes
 #include <avr/io.h>
@@ -47,36 +49,40 @@
 #define NOP() asm("nop")
 #endif
 
+// moving average window size
+// want this to equate to 200ms s.t. window covers 12 full cycles of 60Hz and 10 full cycles of 50Hz
+#define ADC_WINDOW_SIZE 2000
+
 // global variables for ADC
 // TODO: replace globals with another mechanism for passing data to/from ISR
-#define ADC_WINDOW_SIZE 10
 volatile uint16_t adc_result_vector[ADC_WINDOW_SIZE];
 volatile uint16_t  *adc_result_vector_pos = adc_result_vector;
 volatile uint8_t adc_result_vector_full = 0;
-volatile uint8_t adc_result_vector_lock = 0;
+volatile uint32_t adc_sum = 0;
+
+#if(DEBUG_MODE)
+	volatile uint8_t led_flag = 0;
+#endif
 
 // interrupt service routine prototype(s)
 ISR(ADCA_CH0_vect);
+ISR(TCC0_OVF_vect);
 
 // function prototypes
-uint8_t ReadCalibrationByte( uint8_t index );
+uint8_t ReadCalibrationByte( uint8_t index );  // for reading factory ADC calibration bits, unfortunately zeroed-out on ATxmega256A3BU
 
 // simple main function to read from string pot and compute speed
 // TODO: replace all "magic numbers", hard-coded ports, pins, registers, and values with #define statements
 int main(void) {
 
 	// declare variables for use in main() scope
-	volatile uint16_t  *adc_vector_read_pointer;
 	uint8_t loopcount = 0;
-	uint32_t adc_sum;
+	uint8_t temp = 0;
 	uint16_t pos_prev = 0, pos_cur = 0;
+	int32_t delta_pos = 0;
 	float speed;
 
-#if(DEBUG_MODE)
-	uint8_t led_flag = 0;
-#endif
-
-	// change to 16MHz external oscillator
+	/*********** CHANGE TO 16MHz EXTERNAL OSCILLATOR ***********/
 	NOP(); NOP();NOP(); NOP();  				// wait a few clock cycles to be safe
 	OSC.XOSCCTRL = 0xDB; 						// OSC_FRQRANGE_12TO16_gc | OSC_XOSCSEL_XTAL_16KCLK_gc; // select frequency of external oscillator
 	OSC.CTRL = OSC_XOSCEN_bm;  					// turn on external oscillator
@@ -84,43 +90,67 @@ int main(void) {
 	CCP = CCP_IOREG_gc;  						// write correct signature (0xD8) to change protection register first
 	CLK.CTRL = CLK_SCLKSEL_XOSC_gc;  			// use external clock source (0x03); 0x01 selects 32MHz internal RC oscillator
 
-	// configure TCC0 to cycle at 1.00Hz
-	TCC0.CTRLA    = 0x00 | TC_CLKSEL_DIV1024_gc; // prescaler = 1024; 16MHz/1024 = 15.625kHz -> 64us/tick
+	/*********** CONFIGURE TCC0 TO SAMPLE THE ADC IN ONE-SHOT (NOT FREERUNNING) CONFIGURATION ***********/
+	TCC0.CTRLA    = 0x00 | TC_CLKSEL_DIV8_gc; // prescaler = 8; 16MHz/8= 2MHz -> 64us/tick
 	TCC0.CTRLB    = 0x00 | TC_WGMODE_NORMAL_gc; // normal operation (expire at PER)
 	TCC0.CTRLC    = 0x00;
 	TCC0.CTRLD    = 0x00;
 	TCC0.CTRLE    = 0x00;
-	TCC0.INTCTRLA = 0x00 | TC_OVFINTLVL_LO_gc; 	// enable timer overflow interrupt
+	TCC0.INTCTRLA = 0x00 | TC_OVFINTLVL_HI_gc; 	// enable timer overflow interrupt, seems we need a different level than for TCC1 to make them both work?
 	TCC0.INTCTRLB = 0x00;
-	TCC0.PER      = 46875;     				    // 46875 = 3.00s (0.33Hz) with 16MHz clock and prescaler = 1024
-	//TCC0.PER      = 1563;     				    // 10Hz for use when measuring extension of string pot
+	TCC0.PER      = 200;     				    // 200 = 10kHz -> 100us with 16MHz clock at prescaler = 8
 
-	// initialize USART, configure for STDOUT, and send ASCII boot message
+	/*********** CONFIGURE TCC1 TO AVERAGE AND REPORT READINGS AT LOWER FREQUENCY ***********/
+	TCC1.CTRLA    = 0x00 | TC_CLKSEL_DIV1024_gc; // prescaler = 8; 16MHz/8= 2MHz -> 64us/tick
+	TCC1.CTRLB    = 0x00 | TC_WGMODE_NORMAL_gc; // normal operation (expire at PER)
+	TCC1.CTRLC    = 0x00;
+	TCC1.CTRLD    = 0x00;
+	TCC1.CTRLE    = 0x00;
+	TCC1.INTCTRLA = 0x00 | TC_OVFINTLVL_LO_gc; 	// enable timer overflow interrupt
+	TCC1.INTCTRLB = 0x00;
+//	TCC1.PER      = 15625;     				    // 15625 = 1Hz -> 1s with 16MHz clock at prescaler = 1024 ... DON'T FORGET TO CHANGE SPEED CONSTANT
+	TCC1.PER      = 46875;                      // 46875 = 0.33Hz -> 3s with 16MHz clock at prescaler = 1024 ... DON'T FORGET TO CHANGE SPEED CONSTANT
+
+	/*********** INITIALIZE USART, CONFIGURE FOR STDOUT, AND SEND ASCII BOOT MESSAGE ***********/
 	initStdOutUSART();
 	printf("Press Speed Monitor\r\nUsing speed constant %6.2f count*sec/in\r\n",((float)STRING_POT_SPEED_CONST));
 
-	// Initialize ADCA
+	/*********** INITIALIZE ADC ***********/
 	PORTA_DIR = 0x00;  // configure ADC on PORTA to be all input
 	PR.PRPA   = 0x05; // Clear ADC bit in Power Reduction Register, do not send clock to DAC or AC, write n/c bits to 0 per datasheet
-	ADCA.CALL = ReadCalibrationByte( offsetof(NVM_PROD_SIGNATURES_t, ADCACAL0) );
-	ADCA.CALH = ReadCalibrationByte( offsetof(NVM_PROD_SIGNATURES_t, ADCACAL1) );
-	ADCA.CALL = ReadCalibrationByte( offsetof(NVM_PROD_SIGNATURES_t, ADCACAL0) );
-	ADCA.CALH = ReadCalibrationByte( offsetof(NVM_PROD_SIGNATURES_t, ADCACAL1) );
 
-	ADCA.CTRLB      =  (0x00 | 0x80 | 0x08);  // low impedance source (opamp output), freerunning mode
-	ADCA.REFCTRL    =  0x20;
+	// load calibration bytes
+	// note: first read needs to be discarded, so do it twice...
+	// BUT! atxmega256a3bu has 0x00 for both calibration values! https://www.avrfreaks.net/forum/signature-row-reading-issue
+
+	/* to test that we're reading production row...
+	temp = ReadCalibrationByte( offsetof(NVM_PROD_SIGNATURES_t, LOTNUM4) );
+	temp = ReadCalibrationByte( offsetof(NVM_PROD_SIGNATURES_t, LOTNUM4) );
+	printf("LOTNUM4 = 0x%02X\r\n",temp);
+	 */
+
+	//printf("starting cal:     L = 0x%02X, H = 0x%02X\r\n",ADCA.CALL,ADCA.CALH);
+	ADCA.CALL = ReadCalibrationByte( offsetof(NVM_PROD_SIGNATURES_t, ADCACAL0) );
+	ADCA.CALH = ReadCalibrationByte( offsetof(NVM_PROD_SIGNATURES_t, ADCACAL1) );
+	//printf("after first read: L = 0x%02X, H = 0x%02X\r\n",ADCA.CALL,ADCA.CALH);
+	ADCA.CALL = ReadCalibrationByte( offsetof(NVM_PROD_SIGNATURES_t, ADCACAL0) );
+	ADCA.CALH = ReadCalibrationByte( offsetof(NVM_PROD_SIGNATURES_t, ADCACAL1) );
+	//printf("after next read:  L = 0x%02X, H = 0x%02X\r\n",ADCA.CALL,ADCA.CALH);
+
+	ADCA.CTRLB      =  (0x00 | 0x80 | 0x00	);  // low impedance source (opamp output), freerunning mode
+	ADCA.REFCTRL    =  0x10;
 	ADCA.EVCTRL     =  0x00;                  // sweep channel ADC0 only
 	ADCA.PRESCALER  =  0x01;		          // clk_adc = (clk_per / 8) = (16,000,000/8) = 2MHz; ADC clock should be 100kHz - 2MHz
-
 	ADCA.CH0.CTRL    = 0x01; 	              // single ended (in unsigned mode)
 	ADCA.CH0.MUXCTRL = 0x08; 	              // input on pin PA1/ADC1 (#63)
 	ADCA.CH0.INTCTRL = 0x03;  		          // High-level interrupt, triggered on conversion completion
 	ADCA.CTRLA       = 0x01;                  //enable ADC
 
-	// enable interrupts
+	/*********** ENABLE INTERRUPTS ***********/
 	PMIC.CTRL |= PMIC_HILVLEN_bm | PMIC_MEDLVLEN_bm | PMIC_LOLVLEN_bm;
 	sei();
 
+	/*********** ENABLE DEBUG I/O OUTPUT ***********/
 #if(DEBUG_MODE)
 	// configure and clear debug pin
 	PORTA_DIR |= 0x04;
@@ -128,92 +158,84 @@ int main(void) {
 	led_flag = 0;
 #endif
 
-	// continually read string pot position
-	// and report linear velocity
+	/*********** LOOP FOREVER TO CONTINUALLY MEASURE POSITION AND REPORT SPEED ***********/
 	while(1){
 
-		// toggle debug in in DEBUG_MODE
-#if(DEBUG_MODE)
-		if(led_flag){
-			PORTA.OUT &= ~0x04;
-			led_flag = 0;
-		} else {
-			PORTA.OUT |= 0x04;
-			led_flag = 1;
+		// wait until we've collected enough data to average
+		// this should only delay on the first run through the main loop
+		while(!adc_result_vector_full){
+			NOP(); // don't optimize loop away!
 		}
-#endif
-
-		// initialize pointer for copying ADC results
-		// and reset ADC sum to zero
-		adc_vector_read_pointer = adc_result_vector;
-		adc_sum = 0;
-
-		// wait for lock to become available
-		while(adc_result_vector_lock);
-
-		// acquire lock on ADC result vector
-		adc_result_vector_lock = 1;
-
-		// copy ADC results
-		while(adc_vector_read_pointer < (adc_result_vector + ADC_WINDOW_SIZE) ){
-			adc_sum += *adc_vector_read_pointer;
-			++adc_vector_read_pointer;
-		}
-
-		// release lock on ADC result vector
-		adc_result_vector_lock = 0;
 
 		// compute speed
 		pos_cur = (uint16_t)(adc_sum/((uint32_t)ADC_WINDOW_SIZE)); // note: integer division
-		speed = ( ((float)pos_cur) - ((float)pos_prev) ) / ( ((float)STRING_POT_SPEED_CONST) );  // [in/sec]
+		delta_pos = ((int32_t)pos_cur) - ((int32_t)pos_prev);      // in ADC counts
+		speed = ((float)delta_pos) / ((float)STRING_POT_SPEED_CONST);  // [in/sec]
 		pos_prev = pos_cur;
 
-		// display results intermittently
-		// TODO: fix magic number!
-		if(loopcount == 0){
-			printf("ADC Counts: %04u     Speed [in/s]: %+06.3f\r",pos_prev, speed);
-			loopcount = 0;
-		} else{
-			++loopcount;
-		}
+		// display speed
+		printf("ADC value: %10u; Speed [in/s]: %+08.5f\r",pos_cur,speed);
 
-		// force loop timing with TCC0
+		// force loop timing with TCC1
 		// TODO: throw error if this timer has already expired when we get here
 		// potential source of error in computed speed
-		while(!(TCC0.INTFLAGS & TC0_OVFIF_bm));
-		TCC0.INTFLAGS |= TC0_OVFIF_bm;
+		while(!(TCC1.INTFLAGS & TC1_OVFIF_bm));
+		TCC1.INTFLAGS |= TC1_OVFIF_bm;
 
 	}
+}
+
+// start an A/D conversion when TCC0 expires
+ISR(TCC0_OVF_vect){
+#if(DEBUG_MODE)
+	PORTA.OUT |= 0x04;
+	led_flag = 1;
+#endif
+
+	// start a conversion
+	ADCA.CTRLA  |= 0x04;
+
+	// clear interrupt flag (this may happen automatically)
+	TCC0.INTFLAGS |= TC0_OVFIF_bm;
 }
 
 // ADC interrupt vector
 // note: interrupt flag bit automatically cleared on execution
 ISR(ADCA_CH0_vect){
 
-	// only read ADC if we can take the lock
-	if( !adc_result_vector_lock ){
+	// storage for ADC value
+	uint16_t thisADCVal;
 
-		// acquire lock
-		adc_result_vector_lock = 1;
+	// read ADC
+	thisADCVal = ADCA.CH0.RES;
 
-		// store result in ADC array
-		*adc_result_vector_pos = ADCA.CH0.RES;
-
-		// increment pointer
-		++adc_result_vector_pos;
-		if(adc_result_vector_pos >= (adc_result_vector + ADC_WINDOW_SIZE)){
-			adc_result_vector_pos = adc_result_vector;
-			adc_result_vector_full = 1;
-		}
-
-		// release lock
-		adc_result_vector_lock = 0;
-
+	// adjust ADC sum
+	if(adc_result_vector_full){
+		adc_sum -= *adc_result_vector_pos;
 	}
+	adc_sum += thisADCVal;
+	//adc_sum = thisADCVal;
+
+	// store result in ADC array
+	*adc_result_vector_pos = thisADCVal;
+
+	// increment pointer, resetting if necessary
+	if(adc_result_vector_pos < (adc_result_vector + ADC_WINDOW_SIZE -1)){
+		++adc_result_vector_pos;
+	} else {
+		adc_result_vector_pos = adc_result_vector;
+		adc_result_vector_full = 1;  // set flag high once we've filled the vector for the first time
+	}
+
+#if(DEBUG_MODE)
+	PORTA.OUT &= ~0x04;
+	led_flag = 0;
+#endif
 }
 
 // function to get ADC calibration from non-volatile memory
 // directly from: https://www.avrfreaks.net/forum/xmega-production-signature-row
+// NOTE: for the ATxmega256A3BU the calibration bytes are both 0x00 which isn't so useful
 uint8_t ReadCalibrationByte( uint8_t index ){
 	uint8_t result;
 
